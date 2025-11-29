@@ -1,0 +1,421 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display  # for nice styled tables in Jupyter
+
+plt.rcParams["figure.figsize"] = (14, 8)
+
+# ======================================================
+# 0. USER-DEFINED PARAMETERS
+# ======================================================
+
+# Strategy weights (you choose these!)
+BASE_W   = 0.10   # constant baseline TQQQ weight
+W_200    = 0.20   # extra weight when PX > EMA200
+W_RSI    = 0.30   # extra weight when RSI < 30
+W_20     = 0.10   # extra weight when PX > EMA20
+W_CROSS  = 0.10   # extra weight when MA50 > MA200
+
+# Trailing window for last-K-year plot
+K_YEARS = 2
+
+# Leverage multiplier for synthetic TQQQ
+TQQQ_LEV_MULT = 2.928
+
+# ======================================================
+# 1. DOWNLOAD DATA
+# ======================================================
+ndx = yf.download(
+    "^NDX",
+    start="1900-01-01",
+    end="2025-11-26",
+    progress=False,
+    auto_adjust=True,
+)
+
+print("Earliest NDX date available:", ndx.index.min().date())
+print("Rows (full):", len(ndx))
+
+# If MultiIndex columns, flatten
+if isinstance(ndx.columns, pd.MultiIndex):
+    ndx.columns = ["_".join(col).strip() for col in ndx.columns]
+
+# Clean close column
+if "Close" in ndx.columns:
+    close_col = "Close"
+else:
+    close_candidates = [c for c in ndx.columns if "Close" in c]
+    if not close_candidates:
+        raise ValueError("No 'Close' column found in NDX data.")
+    close_col = close_candidates[0]
+
+# Slice from 1985-10-01
+ndx = ndx.loc["1985-10-01":].copy()
+
+# Price & returns
+ndx["PX"] = ndx[close_col].astype(float)
+ndx["Return"] = ndx["PX"].pct_change().fillna(0)
+
+# ======================================================
+# 2. SYNTHETIC TQQQ RETURNS & BUY-AND-HOLD
+# ======================================================
+ndx["TQQQ_ret"] = ndx["Return"] * TQQQ_LEV_MULT
+ndx["TQQQ_BH"] = (1 + ndx["TQQQ_ret"]).cumprod()
+
+tqqq_ret = ndx["TQQQ_ret"].values
+idx = ndx.index
+n = len(ndx)
+
+# ======================================================
+# 3. INDICATORS
+# ======================================================
+ndx["EMA200"] = ndx["PX"].ewm(span=200, adjust=False).mean()
+ndx["EMA20"] = ndx["PX"].ewm(span=20, adjust=False).mean()
+
+# RSI(14)
+period = 14
+delta = ndx["PX"].diff()
+gain = delta.clip(lower=0)
+loss = -delta.clip(upper=0)
+avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+rs = avg_gain / avg_loss.replace(0, np.nan)
+ndx["RSI"] = 100 - (100 / (1 + rs))
+
+# 50/200 MAs for cross
+ndx["MA50"] = ndx["PX"].rolling(window=50).mean()
+ndx["MA200"] = ndx["PX"].rolling(window=200).mean()
+
+# Binary conditions as numpy arrays (1.0 = condition true, else 0.0)
+cond_200   = ((ndx["PX"] > ndx["EMA200"]) & ndx["EMA200"].notna()).astype(float).values
+cond_rsi   = ((ndx["RSI"] < 30) & ndx["RSI"].notna()).astype(float).values
+cond_20    = ((ndx["PX"] > ndx["EMA20"]) & ndx["EMA20"].notna()).astype(float).values
+cond_cross = ((ndx["MA50"] > ndx["MA200"]) &
+              ndx["MA50"].notna() &
+              ndx["MA200"].notna()).astype(float).values
+
+# ======================================================
+# 4. HELPERS: STRATEGY, SHARPE, CAGR
+# ======================================================
+def run_strategy_same_day(base, w_200, w_rsi, w_20, w_cross):
+    """
+    Same-day entry:
+    - Today's indicators -> today's TQQQ weight.
+    - Long-only TQQQ (no SQQQ), exposure clipped to [0, 1].
+    """
+    w_T_raw = (
+        base
+        + w_200  * cond_200
+        + w_rsi  * cond_rsi
+        + w_20   * cond_20
+        + w_cross * cond_cross
+    )
+
+    # Long-only cap: 0 to 100% in TQQQ
+    w_T = np.clip(w_T_raw, 0.0, 1.0)
+
+    ret = w_T * tqqq_ret
+    eq = np.cumprod(1 + ret)
+
+    ret_series = pd.Series(ret, index=idx)
+    eq_series  = pd.Series(eq,  index=idx)
+    w_series   = pd.Series(w_T,  index=idx)
+
+    return ret_series, eq_series, w_series
+
+def calc_sharpe(ret_series):
+    r = ret_series.dropna()
+    sigma = r.std()
+    if sigma == 0 or np.isnan(sigma):
+        return np.nan
+    return r.mean() / sigma * np.sqrt(252)
+
+def calc_cagr(eq_series):
+    eq = eq_series.dropna()
+    start = eq.index[0]
+    end   = eq.index[-1]
+    years = (end - start).days / 365.25
+    final_val = eq.iloc[-1]
+    if final_val <= 0 or years <= 0:
+        return np.nan
+    return final_val**(1/years) - 1
+
+# ======================================================
+# 5. PERFORMANCE FUNCTION
+# ======================================================
+def performance_stats(ret_series, eq_series, name="Strategy"):
+    ret = ret_series.dropna()
+    eq = eq_series.loc[ret.index]
+
+    start = ret.index[0]
+    end   = ret.index[-1]
+    years = (end - start).days / 365.25
+
+    final_val = eq.iloc[-1]
+    cagr = calc_cagr(eq)
+
+    ann_vol = ret.std() * np.sqrt(252)
+    sharpe = calc_sharpe(ret)
+
+    downside = ret[ret < 0]
+    dd_std = downside.std() * np.sqrt(252) if len(downside) > 0 else np.nan
+    sortino = (ret.mean() * 252) / dd_std if (dd_std is not None and dd_std > 0) else np.nan
+
+    roll_max = eq.cummax()
+    dd = eq / roll_max - 1
+    max_dd = dd.min()
+
+    print(f"\n==== {name} ====")
+    print(f"Start:          {start.date()}")
+    print(f"End:            {end.date()}")
+    print(f"Years:          {years:.2f}")
+    print(f"Final Equity:   {final_val:.2f}")
+    print(f"CAGR:           {cagr*100:.2f}%")
+    print(f"Ann Vol:        {ann_vol*100:.2f}%")
+    print(f"Sharpe:         {sharpe:.2f}")
+    print(f"Sortino:        {sortino:.2f}")
+    print(f"Max Drawdown:   {max_dd*100:.2f}%")
+
+    return {
+        "final": final_val,
+        "cagr": cagr,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_dd": max_dd,
+    }
+
+# ======================================================
+# 6. RUN STRATEGY WITH USER WEIGHTS
+# ======================================================
+ret_strat, eq_strat, w_TQQQ = run_strategy_same_day(
+    BASE_W, W_200, W_RSI, W_20, W_CROSS
+)
+
+strat = ndx.copy()
+strat["TQQQ_BH"]   = (1 + strat["TQQQ_ret"]).cumprod()
+strat["w_TQQQ"]    = w_TQQQ
+strat["ret_strat"] = ret_strat
+strat["eq_strat"]  = eq_strat
+
+# Performance
+stats_best = performance_stats(
+    strat["ret_strat"], strat["eq_strat"],
+    name=(
+        "Rule-Based TQQQ "
+        f"(Same-Day, base={BASE_W:.2f}, w200={W_200:.2f}, "
+        f"wRSI={W_RSI:.2f}, w20={W_20:.2f}, wCross={W_CROSS:.2f})"
+    )
+)
+
+stats_bh = performance_stats(
+    strat["TQQQ_ret"], strat["TQQQ_BH"],
+    name="TQQQ Buy & Hold"
+)
+
+# Yearly returns helper
+def yearly_returns(ret_series):
+    out = ret_series.groupby(ret_series.index.year).apply(
+        lambda r: (1 + r).prod() - 1
+    )
+    return out.map(lambda x: f"{x*100:.2f}%")
+
+print("\n=== YEARLY RETURNS (Strategy) ===")
+print(yearly_returns(strat["ret_strat"]))
+
+print("\n=== YEARLY RETURNS (TQQQ BH) ===")
+print(yearly_returns(strat["TQQQ_ret"]))
+
+# ======================================================
+# 7. MAIN PLOTS: EQUITY, WEIGHT, DRAWDOWN
+# ======================================================
+fig, ax = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+
+# (1) Equity
+ax[0].plot(strat.index, strat["TQQQ_BH"], label="TQQQ Buy & Hold", linewidth=1.3)
+ax[0].plot(strat.index, strat["eq_strat"], label="Rule-Based Strategy", linewidth=2.0)
+ax[0].set_yscale("log")
+ax[0].set_title("Equity Curve", fontsize=14)
+ax[0].grid(True, ls="--", alpha=0.4)
+ax[0].legend()
+
+# (2) TQQQ weight timeseries
+ax[1].plot(strat.index, strat["w_TQQQ"], label="TQQQ Weight", linewidth=1.4)
+ax[1].set_title("TQQQ Portfolio Weight Over Time", fontsize=14)
+ax[1].set_ylabel("Weight")
+ax[1].grid(True, ls="--", alpha=0.4)
+ax[1].legend()
+
+# (3) Drawdown
+roll_max = strat["eq_strat"].cummax()
+dd = strat["eq_strat"] / roll_max - 1
+ax[2].plot(strat.index, dd, linewidth=1.2)
+ax[2].fill_between(strat.index, dd, 0, alpha=0.3)
+ax[2].set_title("Drawdown (Strategy)", fontsize=14)
+ax[2].set_ylabel("Drawdown")
+ax[2].grid(True, ls="--", alpha=0.4)
+
+plt.tight_layout()
+plt.show()
+
+# ======================================================
+# 8. DECOMPOSITION: INDIVIDUAL vs FULL STRATEGY
+# ======================================================
+component_strategies = {
+    "Base only":          (BASE_W, 0.0,    0.0,    0.0,    0.0),
+    "EMA200 only":        (0.0,    W_200,  0.0,    0.0,    0.0),
+    "RSI<30 only":        (0.0,    0.0,    W_RSI,  0.0,    0.0),
+    "EMA20 only":         (0.0,    0.0,    0.0,    W_20,   0.0),
+    "MA50>MA200 only":    (0.0,    0.0,    0.0,    0.0,    W_CROSS),
+    "Full combo (user)":  (BASE_W, W_200,  W_RSI,  W_20,   W_CROSS),
+}
+
+equity_df = pd.DataFrame(index=ndx.index)
+equity_df["TQQQ Buy & Hold"] = strat["TQQQ_BH"]
+
+for name, (b, w2, wr, w20_, wc) in component_strategies.items():
+    r_s, e_s, w_s = run_strategy_same_day(b, w2, wr, w20_, wc)
+    equity_df[name] = e_s
+
+plt.figure(figsize=(14, 8))
+for col in equity_df.columns:
+    plt.plot(equity_df.index, equity_df[col], label=col, linewidth=1.4)
+
+plt.yscale("log")
+plt.title("Equity Curves: Component Strategies vs Full Strategy and TQQQ BH", fontsize=14)
+plt.xlabel("Date")
+plt.ylabel("Equity (log scale)")
+plt.grid(True, ls="--", alpha=0.4)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ======================================================
+# 9. TRAILING K-YEAR PLOT: $1 STARTING K YEARS AGO
+# ======================================================
+end_date = strat.index[-1]
+start_date = end_date - pd.DateOffset(years=K_YEARS)
+
+strat_k = strat.loc[strat.index >= start_date].copy()
+
+if len(strat_k) > 0:
+    strat_k["TQQQ_K"]     = (1 + strat_k["TQQQ_ret"]).cumprod()
+    strat_k["eq_strat_K"] = (1 + strat_k["ret_strat"]).cumprod()
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(
+        strat_k.index,
+        strat_k["TQQQ_K"],
+        label=f"TQQQ Buy & Hold (last {K_YEARS} years)",
+        linewidth=1.3,
+    )
+    ax.plot(
+        strat_k.index,
+        strat_k["eq_strat_K"],
+        label=f"Strategy (last {K_YEARS} years)",
+        linewidth=2.0,
+    )
+
+    ax.set_title(
+        f"Trailing {K_YEARS}-Year Equity: $1 in Strategy vs $1 in TQQQ",
+        fontsize=14,
+    )
+    ax.set_ylabel("Equity (starting at $1)")
+    ax.grid(True, ls="--", alpha=0.4)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# ======================================================
+# 10. MONTHLY CALENDAR + DISTRIBUTION & SUMMARY STATS
+# ======================================================
+strat_m = (1 + strat["ret_strat"]).resample("ME").prod() - 1
+strat_y = (1 + strat["ret_strat"]).resample("YE").prod() - 1
+
+def make_calendar_table(monthly, yearly):
+    """
+    monthly: Series with month-end index, monthly returns
+    yearly:  Series with year-end index, full-year returns
+    Returns: DataFrame indexed by year, columns Jan..Dec, Year
+    """
+    df = pd.DataFrame({"Monthly": monthly})
+    df["Year"] = df.index.year
+    df["Month"] = df.index.month
+
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul",
+              "Aug","Sep","Oct","Nov","Dec"]
+    years = sorted(df["Year"].unique())
+
+    cal = pd.DataFrame(index=years, columns=months + ["Year"], dtype=float)
+
+    for y in years:
+        # monthly cells
+        for m, col in enumerate(months, start=1):
+            vals = df.loc[(df["Year"] == y) & (df["Month"] == m), "Monthly"]
+            if not vals.empty:
+                cal.loc[y, col] = float(vals.iloc[0])
+
+        # year-end cell
+        ye_mask = (yearly.index.year == y)
+        if ye_mask.any():
+            cal.loc[y, "Year"] = float(yearly[ye_mask].iloc[0])
+
+    return cal
+
+strat_cal = make_calendar_table(strat_m, strat_y)
+
+# Styling: green for positive, red for negative
+def color_pos_neg(val):
+    if pd.isna(val):
+        return ""
+    if val > 0:
+        return "color: green"
+    if val < 0:
+        return "color: red"
+    return ""
+
+print("\n=== Strategy Monthly / Yearly Return Calendar ===")
+display(
+    strat_cal.style
+    .map(color_pos_neg)
+    .format("{:.2%}")
+)
+
+# -------- Distribution of strategy monthly returns --------
+monthly = strat_m.dropna()
+
+mean_m = monthly.mean()
+median_m = monthly.median()
+std_m = monthly.std()
+min_m = monthly.min()
+max_m = monthly.max()
+p5 = monthly.quantile(0.05)
+p95 = monthly.quantile(0.95)
+
+print("\n=== Strategy Monthly Return Summary Stats ===")
+print(f"Mean monthly return:      {mean_m*100:.2f}%")
+print(f"Median monthly return:    {median_m*100:.2f}%")
+print(f"Std dev (monthly):        {std_m*100:.2f}%")
+print(f"Min monthly return:       {min_m*100:.2f}%")
+print(f"Max monthly return:       {max_m*100:.2f}%")
+print(f"5th percentile (monthly): {p5*100:.2f}%")
+print(f"95th percentile (monthly):{p95*100:.2f}%")
+
+# Approx annualized stats from monthly mean/std
+ann_mean = (1 + mean_m)**12 - 1
+ann_vol  = std_m * np.sqrt(12)
+print(f"\nImplied annualized mean (from monthly): {ann_mean*100:.2f}%")
+print(f"Implied annualized vol  (from monthly): {ann_vol*100:.2f}%")
+
+# Histogram of monthly returns
+plt.figure(figsize=(10, 6))
+plt.hist(monthly, bins=50, edgecolor="black", alpha=0.7)
+plt.axvline(mean_m, linestyle="--", linewidth=1.5, label=f"Mean = {mean_m*100:.2f}%")
+plt.title("Distribution of Strategy Monthly Returns", fontsize=14)
+plt.xlabel("Monthly Return")
+plt.ylabel("Frequency")
+plt.grid(True, ls="--", alpha=0.4)
+plt.legend()
+plt.tight_layout()
+plt.show()
