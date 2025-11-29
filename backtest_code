@@ -11,10 +11,10 @@ plt.rcParams["figure.figsize"] = (14, 8)
 # ======================================================
 
 # Strategy weights (you choose these!)
-BASE_W   = 0.10   # constant baseline TQQQ weight
-W_200    = 0.20   # extra weight when PX > EMA200
-W_RSI    = 0.30   # extra weight when RSI < 30
-W_20     = 0.10   # extra weight when PX > EMA20
+BASE_W   = 0.15   # constant baseline TQQQ weight
+W_200    = 0.30   # extra weight when PX > EMA200
+W_RSI    = 0   # extra weight when RSI < 30
+W_20     = 0.20   # extra weight when PX > EMA20
 W_CROSS  = 0.10   # extra weight when MA50 > MA200
 
 # Trailing window for last-K-year plot
