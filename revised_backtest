@@ -1,0 +1,350 @@
+# ======================================================
+# ONE-CELL BACKTEST (NO RSI, NO MA CROSS) — COPY/PASTE
+# - Choose weights at top (NO optimizing / NO grid search)
+# - Strategy logic:
+#     Long TQQQ exposure = clip(base + w200*1{PX>EMA200} + w20*1{PX>EMA20}, 0..1)
+#     Long SQQQ exposure = clip(wsqqq*1{PX<EMA200 AND PX<EMA20}, 0..1)
+#     Net TQQQ exposure  = w_long - w_sqqq   (can be negative)
+#     Returns            = net_exposure * (LEV * underlying_return)
+# - Outputs:
+#     1) Equity curve plot: TQQQ BH + each component + full combo
+#     2) Drawdown plot: strategy-only (NO TQQQ on drawdown plot)
+#     3) Exposure plot: net TQQQ exposure over time
+#     4) Monthly/Yearly returns calendar (like before)
+#     5) Metrics table
+# ======================================================
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display
+
+plt.rcParams["figure.figsize"] = (14, 8)
+
+# ======================================================
+# 0) USER SETTINGS (EDIT THESE)
+# ======================================================
+TICKER = "^NDX"
+START_DOWNLOAD = "1900-01-01"
+END_DOWNLOAD   = "2025-12-25"
+
+START_BACKTEST = "1985-10-01"
+
+SAME_DAY_ENTRY = True   # True: close->close (signal & apply on same close index)
+                        # False: open_{t+1} -> open_{t+2} aligned to time t (like your prior option)
+
+LEV = 2.928             # your synthetic "TQQQ" leverage
+
+# --------- STRATEGY WEIGHTS (YOU CHOOSE) --------------
+BASE_W  = 0.30          # base long TQQQ exposure in all regimes (clipped 0..1)
+W_EMA200 = 0.30         # add if PX > EMA200
+W_EMA20  = 0.20         # add if PX > EMA20
+W_SQQQ   = 0.50         # long SQQQ (i.e., subtract from TQQQ) when PX < EMA200 AND PX < EMA20
+
+# Calendar frequency choices (leave as-is)
+WEEKLY_RULE = "W-FRI"   # weekly comp to Friday
+MONTHLY_RULE = "ME"     # month-end
+YEARLY_RULE  = "YE"     # year-end
+
+# ======================================================
+# 1) DOWNLOAD + CLEAN
+# ======================================================
+raw = yf.download(
+    TICKER,
+    start=START_DOWNLOAD,
+    end=END_DOWNLOAD,
+    progress=False,
+    auto_adjust=True,
+)
+
+print("Earliest date available:", raw.index.min().date())
+print("Rows (full):", len(raw))
+
+# Handle MultiIndex
+if isinstance(raw.columns, pd.MultiIndex):
+    raw.columns = ["_".join(col).strip() for col in raw.columns]
+
+# Identify Open/Close columns robustly
+def pick_col(cols, key):
+    if key in cols:
+        return key
+    cands = [c for c in cols if key in c]
+    if not cands:
+        raise ValueError(f"No '{key}' column found.")
+    return cands[0]
+
+close_col = pick_col(raw.columns, "Close")
+open_col  = pick_col(raw.columns, "Open")
+
+ndx = raw.loc[START_BACKTEST:].copy()
+ndx["PX"]   = ndx[close_col].astype(float)
+ndx["OPEN"] = ndx[open_col].astype(float)
+
+# ======================================================
+# 2) UNDERLYING RETURNS + SYNTH TQQQ
+# ======================================================
+if SAME_DAY_ENTRY:
+    # close-to-close returns aligned at t
+    ndx["UnderRet"] = ndx["PX"].pct_change().fillna(0.0)
+else:
+    # open_{t+1} -> open_{t+2}, aligned to time t
+    open2_raw = ndx["OPEN"].shift(-2) / ndx["OPEN"].shift(-1) - 1
+    ndx = ndx.iloc[:-2].copy()
+    ndx["UnderRet"] = open2_raw.loc[ndx.index].fillna(0.0)
+
+ndx["TQQQ_ret"] = ndx["UnderRet"] * LEV
+ndx["TQQQ_BH"]  = (1 + ndx["TQQQ_ret"]).cumprod()
+
+idx = ndx.index
+tqqq_ret = ndx["TQQQ_ret"].values
+
+# ======================================================
+# 3) INDICATORS (NO RSI, NO MA CROSS)
+# ======================================================
+ndx["EMA200"] = ndx["PX"].ewm(span=200, adjust=False).mean()
+ndx["EMA20"]  = ndx["PX"].ewm(span=20,  adjust=False).mean()
+
+cond_200 = ((ndx["PX"] > ndx["EMA200"]) & ndx["EMA200"].notna()).astype(float).values
+cond_20  = ((ndx["PX"] > ndx["EMA20"])  & ndx["EMA20"].notna()).astype(float).values
+
+cond_long_sqqq = (
+    (ndx["PX"] < ndx["EMA200"]) &
+    (ndx["PX"] < ndx["EMA20"]) &
+    ndx["EMA200"].notna() &
+    ndx["EMA20"].notna()
+).astype(float).values
+
+# ======================================================
+# 4) HELPERS
+# ======================================================
+def calc_sharpe(ret_series):
+    r = ret_series.dropna()
+    s = r.std()
+    if s == 0 or np.isnan(s):
+        return np.nan
+    return r.mean() / s * np.sqrt(252)
+
+def calc_sortino(ret_series):
+    r = ret_series.dropna()
+    downside = r[r < 0]
+    dd_std = downside.std()
+    if dd_std == 0 or np.isnan(dd_std):
+        return np.nan
+    return r.mean() / dd_std * np.sqrt(252)
+
+def calc_cagr(eq_series):
+    eq = eq_series.dropna()
+    if eq.empty:
+        return np.nan
+    start, end = eq.index[0], eq.index[-1]
+    years = (end - start).days / 365.25
+    if years <= 0:
+        return np.nan
+    final_val = eq.iloc[-1]
+    if final_val <= 0:
+        return np.nan
+    return final_val**(1/years) - 1
+
+def drawdown_series(eq):
+    roll_max = eq.cummax()
+    return eq / roll_max - 1
+
+def perf_block(ret_series, eq_series, name="Strategy"):
+    ret = ret_series.dropna()
+    eq  = eq_series.loc[ret.index]
+
+    start, end = ret.index[0], ret.index[-1]
+    years = (end - start).days / 365.25
+
+    final_val = float(eq.iloc[-1])
+    cagr = calc_cagr(eq)
+
+    ann_vol = float(ret.std() * np.sqrt(252))
+    sharpe  = float(calc_sharpe(ret))
+    sortino = float(calc_sortino(ret))
+
+    dd = drawdown_series(eq)
+    max_dd = float(dd.min())
+
+    return {
+        "Name": name,
+        "Start": start.date(),
+        "End": end.date(),
+        "Years": years,
+        "Final": final_val,
+        "CAGR": cagr,
+        "AnnVol": ann_vol,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "MaxDD": max_dd,
+    }
+
+def make_calendar_table(monthly, yearly):
+    df = pd.DataFrame({"Monthly": monthly}).dropna()
+    df["Year"] = df.index.year
+    df["Month"] = df.index.month
+
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul",
+              "Aug","Sep","Oct","Nov","Dec"]
+    years = sorted(df["Year"].unique())
+
+    cal = pd.DataFrame(index=years, columns=months + ["Year"], dtype=float)
+
+    for y in years:
+        for m, col in enumerate(months, start=1):
+            vals = df.loc[(df["Year"] == y) & (df["Month"] == m), "Monthly"]
+            if not vals.empty:
+                cal.loc[y, col] = float(vals.iloc[0])
+
+        ye_mask = (yearly.index.year == y)
+        if ye_mask.any():
+            cal.loc[y, "Year"] = float(yearly[ye_mask].iloc[0])
+
+    return cal
+
+def color_pos_neg(val):
+    if pd.isna(val):
+        return ""
+    if val > 0:
+        return "color: green"
+    if val < 0:
+        return "color: red"
+    return ""
+
+# ======================================================
+# 5) RUN STRATEGY (FULL + COMPONENT CURVES)
+# ======================================================
+# Long-side raw weights
+w_long_full = np.clip(
+    BASE_W + W_EMA200 * cond_200 + W_EMA20 * cond_20,
+    0.0, 1.0
+)
+
+# SQQQ overlay (subtract exposure)
+w_sqqq_full = np.clip(
+    W_SQQQ * cond_long_sqqq,
+    0.0, 1.0
+)
+
+w_net_full = w_long_full - w_sqqq_full
+
+ret_full = pd.Series(w_net_full * tqqq_ret, index=idx, name="ret_full")
+eq_full  = (1 + ret_full).cumprod()
+eq_full.name = "eq_full"
+
+# Component strategies (for plotting individually)
+def component_curve(base_w, w200, w20, wsqqq):
+    w_long = np.clip(base_w + w200*cond_200 + w20*cond_20, 0.0, 1.0)
+    w_s    = np.clip(wsqqq*cond_long_sqqq, 0.0, 1.0)
+    w_net  = w_long - w_s
+    ret    = pd.Series(w_net * tqqq_ret, index=idx)
+    eq     = (1 + ret).cumprod()
+    return ret, eq, pd.Series(w_net, index=idx), pd.Series(w_long, index=idx), pd.Series(w_s, index=idx)
+
+ret_base,  eq_base,  wnet_base,  _, _ = component_curve(BASE_W, 0.0,     0.0,     0.0)
+ret_200,   eq_200,   wnet_200,   _, _ = component_curve(0.0,   W_EMA200, 0.0,     0.0)
+ret_20,    eq_20,    wnet_20,    _, _ = component_curve(0.0,   0.0,      W_EMA20,  0.0)
+ret_sqqq,  eq_sqqq,  wnet_sqqq,  _, _ = component_curve(0.0,   0.0,      0.0,      W_SQQQ)
+
+# Series for plotting exposure
+w_net_series  = pd.Series(w_net_full, index=idx, name="w_net")
+w_long_series = pd.Series(w_long_full, index=idx, name="w_long")
+w_sqqq_series = pd.Series(w_sqqq_full, index=idx, name="w_sqqq")
+
+# ======================================================
+# 6) METRICS TABLE
+# ======================================================
+metrics = []
+metrics.append(perf_block(ret_full, eq_full, "Full combo (chosen weights)"))
+metrics.append(perf_block(pd.Series(ndx["TQQQ_ret"], index=idx), pd.Series(ndx["TQQQ_BH"], index=idx), "TQQQ Buy & Hold"))
+metrics.append(perf_block(ret_base, eq_base, "Base only (TQQQ)"))
+metrics.append(perf_block(ret_200, eq_200, "EMA200 only (TQQQ)"))
+metrics.append(perf_block(ret_20, eq_20, "EMA20 only (TQQQ)"))
+metrics.append(perf_block(ret_sqqq, eq_sqqq, "Long SQQQ only"))
+
+metrics_df = pd.DataFrame(metrics).set_index("Name")
+fmt_df = metrics_df.copy()
+fmt_df["CAGR"]   = fmt_df["CAGR"] * 100
+fmt_df["AnnVol"] = fmt_df["AnnVol"] * 100
+fmt_df["MaxDD"]  = fmt_df["MaxDD"] * 100
+
+print("\n=== Strategy Weights ===")
+print(f"BASE_W   = {BASE_W:.2f}")
+print(f"W_EMA200 = {W_EMA200:.2f}")
+print(f"W_EMA20  = {W_EMA20:.2f}")
+print(f"W_SQQQ   = {W_SQQQ:.2f}")
+print(f"SAME_DAY_ENTRY = {SAME_DAY_ENTRY}")
+print(f"LEV = {LEV}")
+
+print("\n=== Performance Metrics ===")
+display(
+    fmt_df[["Start","End","Years","Final","CAGR","AnnVol","Sharpe","Sortino","MaxDD"]]
+    .style.format({"Years":"{:.2f}", "Final":"{:.2f}", "CAGR":"{:.2f}%", "AnnVol":"{:.2f}%", "Sharpe":"{:.2f}", "Sortino":"{:.2f}", "MaxDD":"{:.2f}%"})
+)
+
+# ======================================================
+# 7) PLOTS (ONLY WHAT YOU ASKED FOR)
+#   A) ALL-TIME EQUITY CURVES (all strategies + full)
+#   B) DRAWDOWN (strategy only; NO TQQQ on drawdown plot)
+#   C) NET TQQQ EXPOSURE OVER TIME (plus components, optional)
+# ======================================================
+equity_df = pd.DataFrame(index=idx)
+equity_df["TQQQ Buy & Hold"] = ndx["TQQQ_BH"].values
+equity_df["Base only (TQQQ)"] = eq_base.values
+equity_df["EMA200 only (TQQQ)"] = eq_200.values
+equity_df["EMA20 only (TQQQ)"] = eq_20.values
+equity_df["Long SQQQ only"] = eq_sqqq.values
+equity_df["Full combo (chosen weights)"] = eq_full.values
+
+plt.figure(figsize=(14, 8))
+for col in equity_df.columns:
+    plt.plot(equity_df.index, equity_df[col], label=col, linewidth=1.3)
+plt.yscale("log")
+plt.title("Equity Curves (All-time): Components + Full Combo + TQQQ BH (NO RSI, NO MA CROSS)")
+plt.xlabel("Date")
+plt.ylabel("Equity (log scale)")
+plt.grid(True, ls="--", alpha=0.4)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+dd_full = drawdown_series(eq_full)
+
+plt.figure(figsize=(14, 5))
+plt.plot(dd_full.index, dd_full.values, linewidth=1.5, label="Full combo drawdown")
+plt.title("Drawdown (Strategy Only) — TQQQ Removed")
+plt.xlabel("Date")
+plt.ylabel("Drawdown")
+plt.grid(True, ls="--", alpha=0.4)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(14, 5))
+plt.plot(w_net_series.index, w_net_series.values, linewidth=1.2, label="Net TQQQ exposure (w_long - w_sqqq)")
+plt.plot(w_long_series.index, w_long_series.values, linewidth=1.0, label="Long TQQQ weight (clipped 0..1)", alpha=0.9)
+plt.plot(w_sqqq_series.index, (-w_sqqq_series.values), linewidth=1.0, label="- SQQQ weight (as negative exposure)", alpha=0.9)
+plt.title("Exposure Over Time")
+plt.xlabel("Date")
+plt.ylabel("Exposure (net)")
+plt.grid(True, ls="--", alpha=0.4)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ======================================================
+# 8) RETURNS CALENDAR / GRID (MONTHLY + YEARLY)
+# ======================================================
+monthly = (1 + ret_full).resample(MONTHLY_RULE).prod() - 1
+yearly  = (1 + ret_full).resample(YEARLY_RULE).prod() - 1
+
+cal = make_calendar_table(monthly, yearly)
+
+print("\n=== Strategy Monthly / Yearly Return Calendar ===")
+display(cal.style.map(color_pos_neg).format("{:.2%}"))
+
+# (Optional quick weekly summary like before, no extra plots)
+weekly = (1 + ret_full).resample(WEEKLY_RULE).prod() - 1
+print("\nWeekly return summary (strategy):")
+print(weekly.describe(percentiles=[0.05, 0.5, 0.95]).to_string())
